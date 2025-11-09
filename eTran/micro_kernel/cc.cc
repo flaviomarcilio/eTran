@@ -3,6 +3,17 @@
 #include <intf/intf_ebpf.h>
 #include <runtime/tcp.h>
 
+/* DCTCP hysteresis parameters (tunable) */
+#ifndef CC_DCTCP_HYST_PCT
+#define CC_DCTCP_HYST_PCT 5       /* ECN fraction percent threshold to consider 'congested' */
+#endif
+#ifndef CC_DCTCP_HYST_COUNT
+#define CC_DCTCP_HYST_COUNT 2     /* require this many consecutive intervals before reducing */
+#endif
+#ifndef CC_DCTCP_HOLD_US
+#define CC_DCTCP_HOLD_US 50000    /* 50ms hold-after-reduction before allowing increases */
+#endif
+
 void dctcp_wnd_cc(struct tcp_connection *c, struct bpf_cc_snapshot *stats, uint64_t curr_tsc)
 {
     struct cc_dctcp_wnd *cc = &c->cc_data.dctcp_wnd;
@@ -48,6 +59,8 @@ void dctcp_wnd_cc(struct tcp_connection *c, struct bpf_cc_snapshot *stats, uint6
         if (stats->c_drops > 0 || c->cc_rexmits > 0)
         {
             win /= 2;
+            /* record reduction time to inhibit immediate increase */
+            cc->last_reduce_ts = cycles_to_us(curr_tsc);
         }
         else
         {
@@ -65,18 +78,36 @@ void dctcp_wnd_cc(struct tcp_connection *c, struct bpf_cc_snapshot *stats, uint6
                 cc->ecn_rate = ecn_rate;
             }
 
-            /* if ecn marks: reduce window */
-            if (stats->c_ecnb > 0)
+            /* compute instant ECN fraction (percent) for hysteresis decision */
+            if (stats->c_ackb > 0) {
+                uint32_t ecn_frac = (uint32_t)(((uint64_t)stats->c_ecnb * 100) / stats->c_ackb);
+                if (ecn_frac >= CC_DCTCP_HYST_PCT)
+                    cc->ecn_consec_count++;
+                else
+                    cc->ecn_consec_count = 0;
+            } else {
+                /* no data -> reset consecutive count */
+                cc->ecn_consec_count = 0;
+            }
+
+            /* if ecn marks: reduce window only when sustained */
+            if (stats->c_ecnb > 0 && cc->ecn_consec_count >= CC_DCTCP_HYST_COUNT)
             {
                 win = (((uint64_t)win) * (UINT32_MAX - cc->ecn_rate / 2)) / UINT32_MAX;
+                /* record reduction time and reset counter */
+                cc->last_reduce_ts = cycles_to_us(curr_tsc);
+                cc->ecn_consec_count = 0;
             }
             else
             {
-                /* additive increase */
-                assert(win != 0);
-                incr = ((uint64_t)stats->c_ackb * 1448) / win;
-                if ((uint32_t)(win + incr) > win)
-                    win += incr;
+                /* additive increase if not within hold period after a reduction */
+                int32_t since_reduce = (int32_t)(cycles_to_us(curr_tsc) - cc->last_reduce_ts);
+                if (since_reduce >= (int32_t)CC_DCTCP_HOLD_US) {
+                    assert(win != 0);
+                    incr = ((uint64_t)stats->c_ackb * 1448) / win;
+                    if ((uint32_t)(win + incr) > win)
+                        win += incr;
+                }
             }
         }
     }
@@ -138,6 +169,18 @@ void dctcp_rate_cc(struct tcp_connection *c, struct bpf_cc_snapshot *stats, uint
         (void)c_acks;
     }
 
+    /* compute instant ECN fraction (percent) for hysteresis decision */
+    if (c_ackb > 0) {
+        uint32_t ecn_frac = (uint32_t)(((uint64_t)c_ecnb * 100) / c_ackb);
+        if (ecn_frac >= CC_DCTCP_HYST_PCT)
+            cc->ecn_consec_count++;
+        else
+            cc->ecn_consec_count = 0;
+    } else {
+        cc->ecn_consec_count = 0;
+    }
+
+
     /* calculate actual rate */
     if (cc->last_ts != 0)
     {
@@ -183,6 +226,8 @@ void dctcp_rate_cc(struct tcp_connection *c, struct bpf_cc_snapshot *stats, uint
         if (c_drops > 0 || c->cc_rexmits > 0)
         {
             rate /= 2;
+            /* record reduction time to inhibit immediate increase */
+            cc->last_reduce_ts = cur_ts;
         }
         else
         {
@@ -200,21 +245,31 @@ void dctcp_rate_cc(struct tcp_connection *c, struct bpf_cc_snapshot *stats, uint
                 cc->ecn_rate = ecn_rate;
             }
 
-            /* if ecn marks: reduce window */
-            if (c_ecnb > 0)
+            /* if ecn marks: reduce rate only when sustained (hysteresis) */
+            if (c_ecnb > 0 && cc->ecn_consec_count >= CC_DCTCP_HYST_COUNT)
             {
                 rate = (((uint64_t)rate) * (UINT32_MAX - cc->ecn_rate / 2)) /
                        UINT32_MAX;
-            }
-            else if (CC_DCTCP_MIMD == 0)
-            {
-                /* additive increase */
-                rate += CC_DCTCP_STEP;
+                /* record reduction time and reset consecutive counter */
+                cc->last_reduce_ts = cur_ts;
+                cc->ecn_consec_count = 0;
             }
             else
             {
-                /* multiplicative increase */
-                rate += (((uint64_t)rate) * CC_DCTCP_MIMD) / UINT32_MAX;
+                /* additive/multiplicative increase allowed only if hold time passed */
+                int32_t since_reduce = (int32_t)(cur_ts - cc->last_reduce_ts);
+                if (since_reduce >= (int32_t)CC_DCTCP_HOLD_US) {
+                    if (CC_DCTCP_MIMD == 0)
+                    {
+                        /* additive increase */
+                        rate += CC_DCTCP_STEP;
+                    }
+                    else
+                    {
+                        /* multiplicative increase */
+                        rate += (((uint64_t)rate) * CC_DCTCP_MIMD) / UINT32_MAX;
+                    }
+                }
             }
         }
     }

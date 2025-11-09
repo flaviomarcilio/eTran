@@ -198,6 +198,14 @@ struct cc_dctcp_wnd
     uint32_t window;
     /** Flag indicating whether flow is in slow start. */
     int slowstart;
+
+    /* Hysteresis fields:
+     * - ecn_consec_count: Number of consecutive control intervals where ECN
+     *                     fraction >= threshold (for sustained-ECN detection).
+     * - last_reduce_ts: Timestamp (microseconds) of the last congestion window reduction.
+     */
+    uint16_t ecn_consec_count;
+    uint32_t last_reduce_ts;
 };
 
 struct cc_dctcp_rate
@@ -219,6 +227,14 @@ struct cc_dctcp_rate
     uint32_t act_rate;
     /** Flag indicating whether flow is in slow start. */
     int slowstart;
+
+    /* Hysteresis fields:
+     * - ecn_consec_count: Number of consecutive control intervals where ECN
+     *                     fraction >= threshold (for sustained-ECN detection).
+     * - last_reduce_ts: Timestamp (microseconds) of the last congestion rate reduction.
+     */
+    uint16_t ecn_consec_count;
+    uint32_t last_reduce_ts;
 };
 
 struct cc_timely
